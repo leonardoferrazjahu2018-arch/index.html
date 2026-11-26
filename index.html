@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Passa ou Repassa — ESL Edition</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link href="https://fonts.googleapis.com/css2?family=Fredoka:wght@500;600;700&family=Nunito:wght@600;700;800;900&display=swap" rel="stylesheet">
@@ -462,8 +463,11 @@
                     <div class="sbt-oval-sign px-4 py-1.5 rounded-full">
                         <span class="font-game text-sm sm:text-base font-bold text-white tracking-wide">PASSA OU REPASSA</span>
                     </div>
-                    <div id="host-pin-pill" class="px-3 py-1.5 rounded-2xl bg-slate-950/90 border border-amber-400/40 text-xs font-bold text-amber-300">
-                        PIN: <span id="host-pin-value" class="font-game text-base text-white">849201</span>
+                    <div id="host-pin-pill" class="px-3 py-1.5 rounded-2xl bg-slate-950/90 border border-amber-400/40 text-xs font-bold text-amber-300 flex items-center gap-2">
+                        <span>PIN: <span id="host-pin-value" class="font-game text-base text-white">849201</span></span>
+                        <span id="host-online-status" class="px-2 py-0.5 rounded-full bg-amber-500/20 border border-amber-400/40 text-[10px] font-black text-amber-200">
+                            ⏳ Conectando...
+                        </span>
                     </div>
                     <span class="duo-pill bg-lime-400/20 border border-lime-300/50 text-lime-200 text-[10px]">
                         🔥 ESL Streak
@@ -815,7 +819,10 @@
         <!-- Cabeçalho do Aluno -->
         <div class="w-full glass-panel rounded-3xl p-4 border border-slate-700/80 flex items-center justify-between gap-2">
             <div>
-                <div class="text-[11px] font-bold uppercase tracking-wider text-slate-400">PIN <span id="student-room-pin" class="text-amber-300">------</span></div>
+                <div class="text-[11px] font-bold uppercase tracking-wider text-slate-400 flex items-center gap-1.5">
+                    <span>PIN <span id="student-room-pin" class="text-amber-300">------</span></span>
+                    <span id="student-conn-badge" class="px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-200 text-[9px] font-black">⏳ Conectando</span>
+                </div>
                 <div id="student-display-name" class="font-game text-xl font-bold text-white">Aluno</div>
             </div>
             <div class="flex items-center gap-2">
@@ -848,7 +855,7 @@
 
         <!-- Status da Rodada -->
         <div id="student-status-msg" class="w-full text-center px-4 py-2.5 rounded-2xl bg-slate-950/85 border border-slate-800 text-xs sm:text-sm font-bold text-amber-200">
-            Conectado! Aguardando a rodada...
+            Conectando com o palco do professor...
         </div>
 
         <!-- Botão Gigante de Buzina (Quando o aluno é o representante da rodada) -->
@@ -1122,6 +1129,7 @@
         const TEACHER_ACCESS_CODE = '195347';
         const STORAGE_KEY_UNIT = 'passa_esl_unit_v2';
         const STORAGE_KEY_CHALLENGES = 'passa_esl_challenges_v1';
+        const PEER_ROOM_PREFIX = 'passa-esl-sala-';
 
         const DEFAULT_UNIT = {
             title: 'Unit 4: Daily Routines & Simple Present',
@@ -1200,6 +1208,12 @@
         } catch (e) {
             syncChannel = null;
         }
+
+        // Conexão Online (WebRTC via PeerJS) para sincronizar Celular <-> PC pela internet
+        let hostPeer = null;
+        let hostConnections = [];
+        let studentPeer = null;
+        let studentHostConn = null;
 
         let roomState = {
             pin: generateSixDigitPin(),
@@ -1356,6 +1370,183 @@
             if (target) target.classList.remove('hidden');
         }
 
+        // =========================================================
+        // REDE ONLINE PEERJS (CONECTA CELULAR AO PC PELO CÓDIGO PIN)
+        // =========================================================
+        function updateHostOnlineBadge(text, isReady) {
+            const badge = document.getElementById('host-online-status');
+            if (!badge) return;
+            const count = hostConnections.filter(c => c && c.open).length;
+            badge.textContent = isReady ? `🟢 Online (${count} cel.)` : text;
+            badge.className = isReady
+                ? 'px-2 py-0.5 rounded-full bg-emerald-500/20 border border-emerald-400/50 text-[10px] font-black text-emerald-200'
+                : 'px-2 py-0.5 rounded-full bg-amber-500/20 border border-amber-400/40 text-[10px] font-black text-amber-200';
+        }
+
+        function handleIncomingMessageOnHost(data) {
+            if (!data || typeof data !== 'object') return;
+            if (data.pin && data.pin !== roomState.pin) return;
+
+            if (data.type === 'STUDENT_JOIN' && data.player) {
+                const team = data.player.team === 'yellow' ? 'yellow' : 'blue';
+                const name = String(data.player.name || '').trim();
+                if (name && !roomState.players[team].includes(name)) {
+                    roomState.players[team].push(name);
+                    if (roomState.players[team].length === 1) {
+                        roomState.currentReps[team] = name;
+                        renderRepresentativesUI();
+                    }
+                    showToast(`📱 ${name} entrou na ${team === 'blue' ? 'Equipe Azul' : 'Equipe Amarela'}!`, 'sky');
+                }
+                broadcastStateToStudents();
+            } else if (data.type === 'REQUEST_STATE_SYNC') {
+                broadcastStateToStudents();
+            } else if (data.type === 'PLAYER_BUZZ' && data.player) {
+                const team = data.player.team === 'yellow' ? 'yellow' : 'blue';
+                triggerBuzzer(team, data.player.name);
+            } else if (data.type === 'STUDENT_MC_ANSWER' && data.player) {
+                const banner = document.getElementById('student-live-choice-banner');
+                const txt = document.getElementById('student-live-choice-text');
+                const summary = `${data.player.name} (${data.player.team === 'blue' ? 'Azul' : 'Amarelo'}): ${data.choice}`;
+                hostSplitState.lastAnswer = summary;
+                if (banner && txt) {
+                    txt.textContent = summary;
+                    banner.classList.remove('hidden');
+                }
+                syncHostSplitPreview();
+            }
+        }
+
+        function initHostPeerServer() {
+            destroyHostPeerServer();
+            if (!roomState.isPinMode || typeof Peer === 'undefined') {
+                updateHostOnlineBadge('Local', false);
+                return;
+            }
+            updateHostOnlineBadge('⏳ Conectando...', false);
+            try {
+                hostPeer = new Peer(`${PEER_ROOM_PREFIX}${roomState.pin}`, { debug: 0 });
+                hostPeer.on('open', () => {
+                    updateHostOnlineBadge('🟢 Online', true);
+                });
+                hostPeer.on('connection', (conn) => {
+                    hostConnections.push(conn);
+                    conn.on('open', () => {
+                        updateHostOnlineBadge('🟢 Online', true);
+                        const payload = buildStateSyncPayload();
+                        try { conn.send(payload); } catch (e) {}
+                    });
+                    conn.on('data', (data) => {
+                        handleIncomingMessageOnHost(data);
+                    });
+                    conn.on('close', () => {
+                        hostConnections = hostConnections.filter(c => c && c.open);
+                        updateHostOnlineBadge('🟢 Online', true);
+                    });
+                });
+                hostPeer.on('error', (err) => {
+                    if (err && err.type === 'unavailable-id') {
+                        roomState.pin = generateSixDigitPin();
+                        const pinValue = document.getElementById('host-pin-value');
+                        const lobbyPin = document.getElementById('lobby-pin-display');
+                        if (pinValue) pinValue.textContent = roomState.pin;
+                        if (lobbyPin) lobbyPin.textContent = roomState.pin;
+                        refreshInviteLinkField();
+                        initHostPeerServer();
+                    } else {
+                        updateHostOnlineBadge('⚠️ Rede instável', false);
+                    }
+                });
+            } catch (e) {
+                updateHostOnlineBadge('⚠️ Offline', false);
+            }
+        }
+
+        function destroyHostPeerServer() {
+            hostConnections.forEach(c => { try { c.close(); } catch (e) {} });
+            hostConnections = [];
+            if (hostPeer) {
+                try { hostPeer.destroy(); } catch (e) {}
+                hostPeer = null;
+            }
+        }
+
+        function updateStudentConnBadge(text, ok) {
+            const badge = document.getElementById('student-conn-badge');
+            if (!badge) return;
+            badge.textContent = text;
+            badge.className = ok
+                ? 'px-1.5 py-0.5 rounded bg-emerald-500/25 text-emerald-200 text-[9px] font-black'
+                : 'px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-200 text-[9px] font-black';
+        }
+
+        function sendStudentMessageToHost(msg) {
+            if (syncChannel) {
+                try { syncChannel.postMessage(msg); } catch (e) {}
+            }
+            if (studentHostConn && studentHostConn.open) {
+                try { studentHostConn.send(msg); } catch (e) {}
+            }
+        }
+
+        function connectStudentToHostPeer() {
+            destroyStudentPeerClient();
+            if (typeof Peer === 'undefined') {
+                updateStudentConnBadge('Aba local', false);
+                return;
+            }
+            updateStudentConnBadge('⏳ Conectando...', false);
+            try {
+                studentPeer = new Peer(undefined, { debug: 0 });
+                studentPeer.on('open', () => {
+                    const conn = studentPeer.connect(`${PEER_ROOM_PREFIX}${studentSession.pin}`, { reliable: true });
+                    studentHostConn = conn;
+                    conn.on('open', () => {
+                        updateStudentConnBadge('🟢 Ao Vivo', true);
+                        showToast('Conectado ao palco do professor!', 'emerald');
+                        sendStudentMessageToHost({
+                            type: 'STUDENT_JOIN',
+                            pin: studentSession.pin,
+                            player: { name: studentSession.name, team: studentSession.team }
+                        });
+                        sendStudentMessageToHost({
+                            type: 'REQUEST_STATE_SYNC',
+                            pin: studentSession.pin
+                        });
+                    });
+                    conn.on('data', (data) => {
+                        applyIncomingStateOnStudent(data);
+                    });
+                    conn.on('close', () => {
+                        updateStudentConnBadge('🔴 Desconectado', false);
+                    });
+                    conn.on('error', () => {
+                        updateStudentConnBadge('⚠️ Erro de rede', false);
+                    });
+                });
+                studentPeer.on('error', () => {
+                    updateStudentConnBadge('⚠️ Sala não encontrada', false);
+                    const statusEl = document.getElementById('student-status-msg');
+                    if (statusEl) {
+                        statusEl.textContent = '⚠️ Não encontramos a sala com esse PIN. Confira se o professor já clicou em "Abrir Sala PIN".';
+                    }
+                });
+            } catch (e) {
+                updateStudentConnBadge('⚠️ Offline', false);
+            }
+        }
+
+        function destroyStudentPeerClient() {
+            if (studentHostConn) {
+                try { studentHostConn.close(); } catch (e) {}
+                studentHostConn = null;
+            }
+            if (studentPeer) {
+                try { studentPeer.destroy(); } catch (e) {}
+                studentPeer = null;
+            }
+        }
+
         function unlockTeacherArea() {
             const input = document.getElementById('teacher-password-input');
             const errEl = document.getElementById('teacher-login-error');
@@ -1431,6 +1622,7 @@
             updateChallengeTeamButtons();
             renderHostStage();
             startStageTimer(currentUnit.timerSeconds || 15);
+            initHostPeerServer();
             broadcastStateToStudents();
             playCorrectSound();
             showToast(roomState.isPinMode ? `Sala PIN ${roomState.pin} aberta!` : 'Modo Projetor Único iniciado!', 'emerald');
@@ -1497,6 +1689,9 @@
             if (lobbyPin) lobbyPin.textContent = roomState.pin;
             if (hostPin) hostPin.textContent = roomState.pin;
             refreshInviteLinkField();
+            if (document.getElementById('screen-host') && !document.getElementById('screen-host').classList.contains('hidden')) {
+                initHostPeerServer();
+            }
             showToast(`Novo PIN gerado: ${roomState.pin}`, 'amber');
         }
 
@@ -2414,7 +2609,6 @@
                 return;
             }
 
-            // Desafios rápidos de fala / vocabulário / gramática (7, 8, 9)
             const promptCard = document.createElement('div');
             promptCard.className = 'space-y-4 max-w-lg';
             if (id === 'tongue_twister') {
@@ -2684,20 +2878,17 @@
 
             showScreen('screen-student');
             initStudentSyncListener();
+            connectStudentToHostPeer();
 
-            if (syncChannel) {
-                try {
-                    syncChannel.postMessage({
-                        type: 'STUDENT_JOIN',
-                        pin: studentSession.pin,
-                        player: { name: studentSession.name, team: studentSession.team }
-                    });
-                    syncChannel.postMessage({
-                        type: 'REQUEST_STATE_SYNC',
-                        pin: studentSession.pin
-                    });
-                } catch (e) {}
-            }
+            sendStudentMessageToHost({
+                type: 'STUDENT_JOIN',
+                pin: studentSession.pin,
+                player: { name: studentSession.name, team: studentSession.team }
+            });
+            sendStudentMessageToHost({
+                type: 'REQUEST_STATE_SYNC',
+                pin: studentSession.pin
+            });
         }
 
         function pressStudentBuzzer() {
@@ -2708,15 +2899,11 @@
             if (statusEl) {
                 statusEl.textContent = '🔔 Você apertou a buzina! Aguardando o professor...';
             }
-            if (syncChannel) {
-                try {
-                    syncChannel.postMessage({
-                        type: 'PLAYER_BUZZ',
-                        pin: studentSession.pin,
-                        player: { name: studentSession.name, team: studentSession.team }
-                    });
-                } catch (e) {}
-            }
+            sendStudentMessageToHost({
+                type: 'PLAYER_BUZZ',
+                pin: studentSession.pin,
+                player: { name: studentSession.name, team: studentSession.team }
+            });
         }
 
         function submitStudentMcChoice(optionText, letter) {
@@ -2731,16 +2918,12 @@
                 b.classList.toggle('ring-4', picked);
                 b.classList.toggle('ring-emerald-300', picked);
             });
-            if (syncChannel) {
-                try {
-                    syncChannel.postMessage({
-                        type: 'STUDENT_MC_ANSWER',
-                        pin: studentSession.pin,
-                        player: { name: studentSession.name, team: studentSession.team },
-                        choice: `${letter}) ${optionText}`
-                    });
-                } catch (e) {}
-            }
+            sendStudentMessageToHost({
+                type: 'STUDENT_MC_ANSWER',
+                pin: studentSession.pin,
+                player: { name: studentSession.name, team: studentSession.team },
+                choice: `${letter}) ${optionText}`
+            });
         }
 
         function renderStudentMcOptions(options, currentQKey) {
@@ -2851,80 +3034,93 @@
             }
         }
 
+        function applyIncomingStateOnStudent(data) {
+            if (!data || typeof data !== 'object') return;
+            if (data.pin && studentSession.pin && data.pin !== studentSession.pin) return;
+
+            if (data.type === 'STATE_SYNC' && data.state) {
+                const st = data.state;
+                if (st.scores) updateStudentLiveScores(st.scores);
+                if (st.currentReps) {
+                    roomState.currentReps = {
+                        blue: st.currentReps.blue || 'Representante Azul',
+                        yellow: st.currentReps.yellow || 'Representante Amarelo'
+                    };
+                }
+                applyChallengeSyncToStudent(st.challengeSync || null);
+
+                const myName = (studentSession.name || '').trim().toLowerCase();
+                const myTeam = studentSession.team || 'blue';
+                const repName = (roomState.currentReps[myTeam] || '').trim().toLowerCase();
+                const roster = Array.isArray(st.players?.[myTeam]) ? st.players[myTeam] : [];
+                const canBuzz = !st.activeTeam && (roster.length <= 1 || !repName || repName === myName);
+
+                const buzzBtn = document.getElementById('student-buzzer-btn');
+                const suppCard = document.getElementById('student-support-card');
+                const repDisp = document.getElementById('student-active-rep-name');
+                if (repDisp) repDisp.textContent = roomState.currentReps[myTeam] || 'Representante';
+                if (buzzBtn && suppCard) {
+                    buzzBtn.classList.toggle('hidden', !canBuzz);
+                    suppCard.classList.toggle('hidden', canBuzz);
+                }
+
+                const statusEl = document.getElementById('student-status-msg');
+                if (statusEl) {
+                    if (st.activeTeam) {
+                        statusEl.textContent = `🚨 Vez da ${st.activeTeam === 'blue' ? 'Equipe Azul' : 'Equipe Amarela'} (${st.activePlayer || 'Representante'})!`;
+                    } else {
+                        statusEl.textContent = canBuzz
+                            ? '🟢 SUA VEZ NA BUZINA!'
+                            : `🤝 Duelo: ${st.currentReps.blue} vs ${st.currentReps.yellow}`;
+                    }
+                }
+
+                if (Array.isArray(st.questionOptions) && st.questionOptions.length > 0) {
+                    renderStudentMcOptions(st.questionOptions, `q-${st.questionIndex}-${st.questionPrompt || ''}`);
+                } else {
+                    renderStudentMcOptions([], '');
+                }
+            }
+        }
+
         function initStudentSyncListener() {
             if (!syncChannel) return;
             syncChannel.onmessage = (event) => {
-                const data = event?.data;
-                if (!data || typeof data !== 'object') return;
-                if (data.pin && studentSession.pin && data.pin !== studentSession.pin) return;
+                applyIncomingStateOnStudent(event?.data);
+            };
+        }
 
-                if (data.type === 'STATE_SYNC' && data.state) {
-                    const st = data.state;
-                    if (st.scores) updateStudentLiveScores(st.scores);
-                    if (st.currentReps) {
-                        roomState.currentReps = {
-                            blue: st.currentReps.blue || 'Representante Azul',
-                            yellow: st.currentReps.yellow || 'Representante Amarelo'
-                        };
-                    }
-                    applyChallengeSyncToStudent(st.challengeSync || null);
-
-                    const myName = (studentSession.name || '').trim().toLowerCase();
-                    const myTeam = studentSession.team || 'blue';
-                    const repName = (roomState.currentReps[myTeam] || '').trim().toLowerCase();
-                    const roster = Array.isArray(roomState.players[myTeam]) ? roomState.players[myTeam] : [];
-                    const canBuzz = !st.activeTeam && (roster.length <= 1 || !repName || repName === myName);
-
-                    const buzzBtn = document.getElementById('student-buzzer-btn');
-                    const suppCard = document.getElementById('student-support-card');
-                    const repDisp = document.getElementById('student-active-rep-name');
-                    if (repDisp) repDisp.textContent = roomState.currentReps[myTeam] || 'Representante';
-                    if (buzzBtn && suppCard) {
-                        buzzBtn.classList.toggle('hidden', !canBuzz);
-                        suppCard.classList.toggle('hidden', canBuzz);
-                    }
-
-                    const statusEl = document.getElementById('student-status-msg');
-                    if (statusEl) {
-                        if (st.activeTeam) {
-                            statusEl.textContent = `🚨 Vez da ${st.activeTeam === 'blue' ? 'Equipe Azul' : 'Equipe Amarela'} (${st.activePlayer || 'Representante'})!`;
-                        } else {
-                            statusEl.textContent = canBuzz
-                                ? '🟢 SUA VEZ NA BUZINA!'
-                                : `🤝 Duelo: ${st.currentReps.blue} vs ${st.currentReps.yellow}`;
-                        }
-                    }
-
-                    if (Array.isArray(st.questionOptions) && st.questionOptions.length > 0) {
-                        renderStudentMcOptions(st.questionOptions, `q-${st.questionIndex}-${st.questionPrompt || ''}`);
-                    } else {
-                        renderStudentMcOptions([], '');
-                    }
+        function buildStateSyncPayload() {
+            const qs = currentUnit.questions || [];
+            const q = qs[roomState.questionIndex] || null;
+            return {
+                type: 'STATE_SYNC',
+                pin: roomState.pin,
+                state: {
+                    scores: roomState.scores,
+                    activeTeam: roomState.activeTeam,
+                    activePlayer: roomState.activePlayer,
+                    currentReps: roomState.currentReps,
+                    players: roomState.players,
+                    questionIndex: roomState.questionIndex,
+                    questionPrompt: q ? q.prompt : '',
+                    questionOptions: q ? normalizeQuestionOptions(q) : [],
+                    challengeSync: getStudentChallengePayload()
                 }
             };
         }
 
         function broadcastStateToStudents() {
-            if (!syncChannel || !roomState.isPinMode) return;
-            const qs = currentUnit.questions || [];
-            const q = qs[roomState.questionIndex] || null;
-            try {
-                syncChannel.postMessage({
-                    type: 'STATE_SYNC',
-                    pin: roomState.pin,
-                    state: {
-                        scores: roomState.scores,
-                        activeTeam: roomState.activeTeam,
-                        activePlayer: roomState.activePlayer,
-                        currentReps: roomState.currentReps,
-                        players: roomState.players,
-                        questionIndex: roomState.questionIndex,
-                        questionPrompt: q ? q.prompt : '',
-                        questionOptions: q ? normalizeQuestionOptions(q) : [],
-                        challengeSync: getStudentChallengePayload()
-                    }
-                });
-            } catch (e) {}
+            if (!roomState.isPinMode) return;
+            const payload = buildStateSyncPayload();
+            if (syncChannel) {
+                try { syncChannel.postMessage(payload); } catch (e) {}
+            }
+            hostConnections.forEach(conn => {
+                if (conn && conn.open) {
+                    try { conn.send(payload); } catch (e) {}
+                }
+            });
         }
 
         // =========================================================
@@ -3010,6 +3206,8 @@
             clearInterval(stageTimerInterval);
             clearInterval(blitzInterval);
             cleanupChallengeTimers();
+            destroyHostPeerServer();
+            destroyStudentPeerClient();
             showScreen('screen-home');
         }
 
@@ -3043,38 +3241,7 @@
 
         if (syncChannel) {
             syncChannel.addEventListener('message', (event) => {
-                const data = event?.data;
-                if (!data || typeof data !== 'object') return;
-                if (data.pin && data.pin !== roomState.pin) return;
-
-                if (data.type === 'STUDENT_JOIN' && data.player) {
-                    const team = data.player.team === 'yellow' ? 'yellow' : 'blue';
-                    const name = String(data.player.name || '').trim();
-                    if (name && !roomState.players[team].includes(name)) {
-                        roomState.players[team].push(name);
-                        if (roomState.players[team].length === 1) {
-                            roomState.currentReps[team] = name;
-                            renderRepresentativesUI();
-                        }
-                        showToast(`${name} entrou na ${team === 'blue' ? 'Equipe Azul' : 'Equipe Amarela'}!`, 'sky');
-                        broadcastStateToStudents();
-                    }
-                } else if (data.type === 'REQUEST_STATE_SYNC') {
-                    broadcastStateToStudents();
-                } else if (data.type === 'PLAYER_BUZZ' && data.player) {
-                    const team = data.player.team === 'yellow' ? 'yellow' : 'blue';
-                    triggerBuzzer(team, data.player.name);
-                } else if (data.type === 'STUDENT_MC_ANSWER' && data.player) {
-                    const banner = document.getElementById('student-live-choice-banner');
-                    const txt = document.getElementById('student-live-choice-text');
-                    const summary = `${data.player.name} (${data.player.team === 'blue' ? 'Azul' : 'Amarelo'}): ${data.choice}`;
-                    hostSplitState.lastAnswer = summary;
-                    if (banner && txt) {
-                        txt.textContent = summary;
-                        banner.classList.remove('hidden');
-                    }
-                    syncHostSplitPreview();
-                }
+                handleIncomingMessageOnHost(event?.data);
             });
         }
 
